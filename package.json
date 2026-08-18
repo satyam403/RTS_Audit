@@ -8,10 +8,17 @@
   "main": "index.js",
   "scripts": {
     "dev": "node index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "login": "node login.js",
+    "daily": "node daily.js",
+    "daily:visible": "RTS_HEADLESS=0 node daily.js",
+    "schedule:install": "bash scripts/install-schedule.sh",
+    "schedule:uninstall": "bash scripts/uninstall-schedule.sh",
+    "schedule:status": "launchctl list | grep rtsaudit || echo 'not loaded'"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
+    "nodemailer": "^9.0.5",
     "playwright": "^1.59.1",
     "xlsx": "^0.18.5"
   }

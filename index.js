@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url';
 import XLSX from 'xlsx';
 import { getRecordsByField, updateRecords, createRecords } from './airtable.js';
 
-const DOWNLOADS_DIR = path.resolve('downloads');
+// Resolve against this file, not the CWD — launchd/cron start the process elsewhere.
+const ROOT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DOWNLOADS_DIR = path.join(ROOT_DIR, 'downloads');
+const authPath = (file) => path.join(ROOT_DIR, file);
 
 export const ACCOUNTS = {
   default: {
@@ -75,38 +78,116 @@ export const CONFIG = {
     },
   },
   viewport: { width: 1440, height: 900 },
-  autoClose: false, // when true, skips the "Press ENTER to close" prompt at the end of each report
+  navTimeoutMs: 90_000, // rtspro.com is slow; the default 30s was aborting real runs
+  autoClose: false,  // when true, skips the "Press ENTER to close" prompt at the end of each report
+  headless: false,   // daily.js flips this on; keep false for interactive/debug runs
+  unattended: false, // when true: never block on a prompt, and throw NeedsHumanLoginError instead of waiting for a human
+  verbose: true,     // when false, skips the full-Map console dumps (they blow up log files on big date ranges)
 };
 
+/** Thrown in unattended mode when RTS wants a human (2FA / consent / rotated password). */
+export class NeedsHumanLoginError extends Error {
+  constructor(accountName) {
+    super(`${accountName} needs a human login — run \`npm run dev\` interactively once to re-establish the session.`);
+    this.name = 'NeedsHumanLoginError';
+    this.account = accountName;
+  }
+}
+
 async function waitForEnter(prompt) {
+  // Under launchd/cron there is no TTY — blocking here would hang the job forever.
+  if (CONFIG.unattended || !input.isTTY) {
+    console.log(`[prompt] Skipped (no human attached): ${prompt.trim()}`);
+    return;
+  }
   const rl = readline.createInterface({ input, output });
   await rl.question(prompt);
   rl.close();
 }
 
-async function autofillLogin(page, account) {
+/**
+ * rtspro.com puts two click-throughs in front of the Auth0 form: a language
+ * chooser, then a Welcome screen with "Create Account" / "Log In". Neither is a
+ * login form, so the username selector never appears until both are cleared.
+ */
+const visible = (page, selector) =>
+  page.locator(selector).first().isVisible().catch(() => false);
+
+/**
+ * `waitUntil: 'load'` blocks on every last asset, and this SPA regularly never
+ * fires it — a 30s nav timeout was killing runs. DOM-ready plus an explicit
+ * settle is both faster and far more reliable.
+ */
+export async function gotoStable(page, url, settleMs = 4000) {
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.navTimeoutMs });
+  await page.waitForTimeout(settleMs);
+}
+
+export async function dismissEntryGates(page) {
+  for (let pass = 0; pass < 5; pass++) {
+    // The shell is a SPA — give it a beat to paint before judging what we see.
+    await page.waitForTimeout(2500);
+
+    // Already at the Auth0 form (or past it): nothing left to clear.
+    if (await visible(page, CONFIG.selectors.username)) return;
+    if (await visible(page, CONFIG.selectors.password)) return;
+
+    // Check "Log In" before "Continue": the Auth0 form also has a Continue button.
+    if (await visible(page, 'button:has-text("Log In")')) {
+      console.log('[gate] Welcome screen — clicking Log In...');
+      await page.locator('button:has-text("Log In")').first().click().catch(() => {});
+      await page.waitForTimeout(6000);
+      continue;
+    }
+
+    if (await visible(page, 'button:has-text("Continue")')) {
+      console.log('[gate] Language screen — clicking Continue...');
+      await page.locator('button:has-text("Continue")').first().click().catch(() => {});
+      await page.waitForTimeout(4000);
+      continue;
+    }
+
+    return; // nothing recognisable in the way
+  }
+  console.log('[gate] Gates still present after 5 passes — continuing anyway.');
+}
+
+export async function autofillLogin(page, account) {
   if (!account.user || !account.pass) {
     throw new Error(`Missing credentials for ${account.name} (set the RTS_*_USER and RTS_*_PASS env vars)`);
   }
+
+  await dismissEntryGates(page);
 
   console.log(`[login] Autofilling credentials for ${account.name}...`);
   await page.waitForSelector(CONFIG.selectors.username, { timeout: 20000 });
   await page.fill(CONFIG.selectors.username, account.user);
 
-  const passwordVisibleNow = await page
-    .locator(CONFIG.selectors.password)
-    .isVisible()
-    .catch(() => false);
+  const passwordVisibleNow = await visible(page, CONFIG.selectors.password);
+
+  // Auth0 renders duplicate submit buttons and the first is overlapped by the
+  // input itself, so clicking it fails. Submitting from the field always works;
+  // the button click stays as a fallback in case they change the markup.
+  const submitFrom = async (fieldSelector) => {
+    await page.locator(fieldSelector).first().press('Enter');
+    await page.waitForTimeout(1500);
+  };
 
   if (!passwordVisibleNow) {
-    console.log('[login] Clicking continue (identifier step)...');
-    await page.click(CONFIG.selectors.submit);
-    await page.waitForSelector(CONFIG.selectors.password, { timeout: 20000 });
+    console.log('[login] Submitting identifier step...');
+    await submitFrom(CONFIG.selectors.username);
+    try {
+      await page.waitForSelector(CONFIG.selectors.password, { timeout: 20000 });
+    } catch {
+      console.log('[login] Enter did not advance — falling back to the submit button.');
+      await page.locator(CONFIG.selectors.submit).last().click({ timeout: 10000 }).catch(() => {});
+      await page.waitForSelector(CONFIG.selectors.password, { timeout: 20000 });
+    }
   }
 
   console.log('[login] Filling password & submitting...');
   await page.fill(CONFIG.selectors.password, account.pass);
-  await page.click(CONFIG.selectors.submit);
+  await submitFrom(CONFIG.selectors.password);
 }
 
 function isAuthUrl(url) {
@@ -115,7 +196,7 @@ function isAuthUrl(url) {
 
 async function saveSession(context, label, authFile) {
   try {
-    await context.storageState({ path: authFile });
+    await context.storageState({ path: authPath(authFile) });
     console.log(`[auth] Session saved to ${authFile} (${label}).`);
   } catch (err) {
     console.error(`[auth] Failed to save session (${label}):`, err.message);
@@ -124,6 +205,14 @@ async function saveSession(context, label, authFile) {
 
 async function isLoginShown(page) {
   if (isAuthUrl(page.url())) return true;
+
+  // The pre-auth gates aren't login forms, but reaching one means we're signed out.
+  for (const gate of ['text=Choose Your language', 'button:has-text("Log In")']) {
+    if (await page.locator(gate).first().isVisible().catch(() => false)) {
+      console.log(`[auth] Pre-login gate detected: ${gate}`);
+      return true;
+    }
+  }
 
   const candidates = [
     CONFIG.selectors.username,
@@ -178,6 +267,7 @@ async function runLoginFlow(page, context, account) {
     await autofillLogin(page, account);
   } catch (err) {
     console.error('[auth] Autofill error (will fall back to manual):', err.message);
+    if (CONFIG.unattended) throw new NeedsHumanLoginError(account.name);
   }
 
   try {
@@ -185,6 +275,18 @@ async function runLoginFlow(page, context, account) {
     console.log(`[auth] Auto-redirected to: ${page.url()}`);
   } catch {
     console.log('[auth] Did not auto-redirect — finish login in the browser.');
+  }
+
+  if (CONFIG.unattended) {
+    // Nobody is watching: confirm autofill actually got us in before we carry on.
+    await page.waitForTimeout(3000);
+    if (await isLoginShown(page)) {
+      await dumpPageDiagnostics(page, `needs-login-${account.authFile.replace(/\W+/g, '-')}`);
+      throw new NeedsHumanLoginError(account.name);
+    }
+    console.log('[auth] Unattended re-login succeeded.');
+    await saveSession(context, 'after-login', account.authFile);
+    return;
   }
 
   console.log('\n>>> Make sure you are fully logged into the RTS app (not on the login page).');
@@ -195,8 +297,7 @@ async function runLoginFlow(page, context, account) {
 
 async function navigateAuthenticated(page, context, targetUrl, account) {
   console.log(`[nav] Navigating to ${targetUrl}...`);
-  await page.goto(targetUrl, { waitUntil: 'load' });
-  await page.waitForTimeout(4000);
+  await gotoStable(page, targetUrl);
   console.log(`[nav] Landed at: ${page.url()}`);
 
   await dumpPageDiagnostics(page, 'after-nav');
@@ -206,8 +307,7 @@ async function navigateAuthenticated(page, context, targetUrl, account) {
     await runLoginFlow(page, context, account);
 
     console.log(`[nav] Re-navigating to ${targetUrl}...`);
-    await page.goto(targetUrl, { waitUntil: 'load' });
-    await page.waitForTimeout(2000);
+    await gotoStable(page, targetUrl, 3000);
     console.log(`[nav] Final URL: ${page.url()}`);
 
     if (await isLoginShown(page)) {
@@ -218,18 +318,29 @@ async function navigateAuthenticated(page, context, targetUrl, account) {
 }
 
 async function launchBrowser(authFile) {
-  const hasAuth = fs.existsSync(authFile);
-  const browser = await chromium.launch({ headless: false });
+  const resolved = authPath(authFile);
+  const hasAuth = fs.existsSync(resolved);
+  const browser = await chromium.launch({ headless: CONFIG.headless });
   const context = await browser.newContext({
     acceptDownloads: true,
     viewport: CONFIG.viewport,
-    storageState: hasAuth ? authFile : undefined,
+    storageState: hasAuth ? resolved : undefined,
     permissions: ['geolocation'],
     geolocation: { latitude: 39.0997, longitude: -94.5786 },
   });
   await context.grantPermissions(['geolocation'], { origin: 'https://rtspro.com' });
   const page = await context.newPage();
   return { browser, context, page };
+}
+
+/** Full-Map dumps are useful interactively but murder log files on 30-day ranges. */
+function dumpMap(label, map) {
+  if (!CONFIG.verbose) {
+    console.log(`${label} ${map.size} entries (set CONFIG.verbose to list them).`);
+    return;
+  }
+  console.log(label);
+  console.log(Object.fromEntries(map));
 }
 
 function parseMoney(v) {
@@ -609,8 +720,7 @@ async function processPaymentsReport(page, context, account, dateRange) {
     if (key) paymentsMap.set(key, r);
   }
 
-  console.log(`[payments] Final Map (${paymentsMap.size} entries):`);
-  console.log(Object.fromEntries(paymentsMap));
+  dumpMap(`[payments] Final Map (${paymentsMap.size} entries):`, paymentsMap);
 
   return paymentsMap;
 }
@@ -727,8 +837,7 @@ async function processRecoursedReport(page, context, account, dateRange) {
     if (r.invoiceNo) recoursedMap.set(r.invoiceNo, r);
   }
 
-  console.log(`[recoursed] Final Map (${recoursedMap.size} entries):`);
-  console.log(Object.fromEntries(recoursedMap));
+  dumpMap(`[recoursed] Final Map (${recoursedMap.size} entries):`, recoursedMap);
 
   return recoursedMap;
 }
@@ -914,7 +1023,8 @@ async function downloadAllRowsSequential(page, purchaseMap) {
 
     try {
       await downloadOneRow(page, i, purchaseMap);
-      console.log(`[map]`, Object.fromEntries(purchaseMap));
+      if (CONFIG.verbose) console.log(`[map]`, Object.fromEntries(purchaseMap));
+      else console.log(`[purchase] Row ${i + 1}/${total} done — ${purchaseMap.size} invoice(s) collected.`);
     } catch (err) {
       console.error(`Row ${i + 1} failed:`, err.message);
     }
@@ -935,8 +1045,7 @@ async function processPurchaseReport(page, context, account, dateRange) {
   const purchaseMap = new Map();
   await downloadAllRowsSequential(page, purchaseMap);
 
-  console.log(`\n[map] Final purchase Map (${purchaseMap.size} entries):`);
-  console.log(Object.fromEntries(purchaseMap));
+  dumpMap(`\n[map] Final purchase Map (${purchaseMap.size} entries):`, purchaseMap);
 
   return purchaseMap;
 }

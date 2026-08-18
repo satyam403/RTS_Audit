@@ -4,12 +4,17 @@
 !.env.example
 auth.json
 auth-*.json
+.mfa-*.json
 
 # Downloads & generated artifacts
 downloads/
 *.xlsx
 *.xls
 *.csv
+
+# Daily runner
+logs/
+.daily.lock
 
 # Logs
 *.log

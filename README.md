@@ -129,16 +129,127 @@ Records that match by number but fail verification are reported as **Ambiguous**
 
 Empty cells in the Excel are skipped so existing Airtable values aren't overwritten with blanks.
 
+## Daily automated run
+
+`daily.js` runs **all 9 combinations** (3 accounts × 3 reports) unattended over a
+rolling 30-day window, and `launchd` fires it once a day.
+
+### One-time setup
+
+```bash
+cp .env.example .env          # fill in RTS creds, Airtable PAT, SMTP settings
+npm install
+npx playwright install chromium
+```
+
+Then establish a session for each account once, by hand — this is the only step a
+human is required for:
+
+```bash
+npm run login                 # all three, one after another
+npm run login chandi          # or just one
+```
+
+A browser opens per account, credentials autofill, you enter the SMS code, and
+the session is saved to `auth-<account>.json`. `login.js` never touches Airtable,
+so it's safe to re-run.
+
+### The 30-day ceiling — read this
+
+RTS protects login with **SMS multi-factor auth**, and no automation can clear
+it. The login flow really is:
+
+```
+rtspro.com → language gate → Welcome screen ("Log In")
+           → auth.rtspro.com  → email → password
+           → SMS code to the account's phone
+```
+
+What makes unattended running possible is the **"Remember this device for 30
+days"** checkbox on the code screen. `login.js` ticks it for you and tells you
+whether it succeeded. So the real cost is:
+
+| | |
+| --- | --- |
+| Human effort | ~1 minute, once every 30 days, per account |
+| Everything in between | fully automatic |
+
+`login.js` stamps `.mfa-<account>.json` when trust is established. The nightly
+job prints the remaining days each run and **emails you at day 25**, so you
+re-authorise before anything breaks rather than after. Tune with
+`RTS_TRUST_WARN_DAYS`.
+
+If trust does lapse, the job reports `needs-login`, skips that account's
+remaining reports, and emails you the exact command to run. Nothing corrupts;
+the next night resumes normally.
+
+Finally, arm the schedule:
+
+```bash
+npm run schedule:install                          # daily at 07:00 local
+RUN_HOUR=3 RUN_MINUTE=30 npm run schedule:install # or pick your own time
+```
+
+| Command                     | What it does                                    |
+| --------------------------- | ----------------------------------------------- |
+| `npm run login [accounts…]` | Interactive login, saves `auth-*.json`          |
+| `npm run daily`             | Run the full sweep now, headless                |
+| `npm run daily:visible`     | Same, but with a visible browser (debugging)    |
+| `npm run schedule:install`  | Install/replace the LaunchAgent                 |
+| `npm run schedule:status`   | Check whether it's loaded                       |
+| `npm run schedule:uninstall`| Remove it                                       |
+
+`launchctl kickstart -k gui/$UID/com.handatransportation.rtsaudit` triggers a run
+immediately without waiting for the schedule.
+
+### How it survives a bad night
+
+| Failure                          | Behaviour                                                        |
+| -------------------------------- | ---------------------------------------------------------------- |
+| One report throws                | Retried once after 60s, then skipped — the other 8 still run     |
+| A report hangs                   | Killed after 30 min, marked failed, run continues                 |
+| The whole run hangs              | Watchdog kills the process after 4h and emails you                |
+| RTS session expired (device still trusted) | Credentials are re-submitted automatically, gates cleared, session re-saved — no human |
+| Device trust nearing 30 days     | Warning email at day 25, before anything fails                    |
+| Device trust lapsed → SMS code   | `needs-login` — that account's remaining reports are skipped, and the email names the exact `npm run login <account>` to run |
+| Previous run still going         | New run exits immediately (lock file) instead of double-writing   |
+| Mac asleep at the scheduled time | launchd runs the job on wake (this is why it isn't cron)          |
+| SMTP broken                      | Logged, run continues — email never takes the job down            |
+
+Nothing ever blocks on a prompt: `waitForEnter` short-circuits when
+`CONFIG.unattended` is set *or* when stdin isn't a TTY.
+
+### Output
+
+- `logs/daily-YYYY-MM-DD.log` — timestamped log per run (pruned after 30 days)
+- `logs/launchd.{out,err}.log` — whatever launchd itself captures
+- `downloads/` — pruned after 7 days
+
+An email goes out **only when something goes wrong**, with the summary table and
+the last 80 log lines. Set `ALERT_ON_SUCCESS=1` if you also want a daily all-clear.
+
+### Tuning
+
+Everything is env-driven — see the commented block at the bottom of
+`.env.example` (`RTS_LOOKBACK_DAYS`, `RTS_ATTEMPTS`, `RTS_JOB_TIMEOUT_MIN`,
+`RTS_RUN_TIMEOUT_MIN`, `RTS_HEADLESS`, …). No need to edit `daily.js`.
+
 ## Files
 
 | File                | Purpose                                                                       |
 | ------------------- | ----------------------------------------------------------------------------- |
 | `index.js`          | Main entrypoint — Playwright flow, Excel parsing, Airtable orchestration      |
+| `daily.js`          | Unattended daily runner — all 9 reports, retries, watchdog, alerting          |
+| `login.js`          | Interactive session bootstrap (`npm run login`) — no Airtable writes          |
+| `notify.js`         | Best-effort SMTP alert helper (never throws)                                  |
 | `airtable.js`       | Airtable REST helpers: `getRecords`, `getRecordsByField`, `updateRecords`     |
+| `previous-year.js`  | Backfill script — chunks a past year into monthly ranges, different base      |
+| `scripts/*.sh`      | launchd install / uninstall                                                   |
 | `auth-*.json`       | Persisted Playwright storage state per account (auto-created after login)     |
-| `.env`              | RTS credentials + Airtable PAT (gitignored)                                   |
+| `.env`              | RTS credentials + Airtable PAT + SMTP settings (gitignored)                   |
 | `downloads/`        | Saved Excel files + diagnostic screenshots (gitignored)                       |
-| `package.json`      | Dependencies + `npm run dev` script                                           |
+| `logs/`             | Daily run logs (gitignored)                                                   |
+| `package.json`      | Dependencies + scripts                                                        |
 
 ## Notes
 
